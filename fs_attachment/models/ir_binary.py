@@ -23,7 +23,7 @@ class IrBinary(models.AbstractModel):
             return record
         field_def = record._fields.get(field_name)
         if field_def:
-            record._check_field_access(field_def, "read")
+            record.check_field_access(field_def, "read")
             if field_def.attachment and field_def.store:
                 fs_attachment = (
                     self.env["ir.attachment"]

@@ -2,7 +2,8 @@
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
 from __future__ import annotations
 
-from odoo.http import STATIC_CACHE_LONG, Response, Stream, request
+from odoo.http import Response, request
+from odoo.http.stream import STATIC_CACHE_LONG, Stream
 
 from .models.ir_attachment import IrAttachment
 
@@ -15,6 +16,21 @@ except ImportError:
 
 class FsStream(Stream):
     fs_attachment = None
+
+    def __init__(self, **kwargs):
+        # 20.0 added `assert self.type in ('data', 'path', 'url')` to
+        # Stream.__init__ (odoo/http/stream.py:87). This class has always used a
+        # fourth type, "fs", which read() and get_response() below handle
+        # themselves -- the base class never sees it at work. Construct as
+        # "data" so the assertion passes, then restore the real type.
+        is_fs = kwargs.get("type") == "fs"
+        if is_fs:
+            kwargs["type"] = "data"
+            kwargs.setdefault("data", b"")
+        super().__init__(**kwargs)
+        if is_fs:
+            self.type = "fs"
+            self.data = None
 
     @classmethod
     def from_fs_attachment(cls, attachment: IrAttachment) -> FsStream:
