@@ -299,7 +299,7 @@ class FSStorage(models.Model):
     @prevent_call_from_safe_eval("create")
     def create(self, vals_list):
         records = super().create(vals_list)
-        self.env.registry.clear_cache()
+        self.env.transaction.invalidate_ormcache()
         return records
 
     @prevent_call_from_safe_eval("create")
@@ -309,7 +309,7 @@ class FSStorage(models.Model):
     @prevent_call_from_safe_eval("write")
     def write(self, vals):
         self.__fs = None
-        self.env.registry.clear_cache()
+        self.env.transaction.invalidate_ormcache()
         return super().write(vals)
 
     @prevent_call_from_safe_eval("write")
@@ -330,7 +330,7 @@ class FSStorage(models.Model):
         )
 
     @api.model
-    @tools.ormcache()
+    @api.ormcache()
     def get_id_by_code_map(self):
         """Return a dictionary with the code as key and the id as value."""
         return {rec.code: rec.id for rec in self.sudo().search([])}
@@ -350,13 +350,13 @@ class FSStorage(models.Model):
         return res
 
     @api.model
-    @tools.ormcache("code")
+    @api.ormcache("code")
     def get_protocol_by_code(self, code):
         record = self.get_by_code(code)
         return record.protocol if record else None
 
     @api.model
-    @tools.ormcache("code")
+    @api.ormcache("code")
     def _is_fs_cacheable(self, code):
         """Return True if the filesystem is cacheable."""
         # This method is used to check if the filesystem is cacheable.
@@ -367,13 +367,13 @@ class FSStorage(models.Model):
         return fs_storage and fs_storage.sudo().is_cacheable
 
     @api.model
-    @tools.ormcache()
+    @api.ormcache()
     def get_storage_codes(self):
         """Return the list of codes of the existing filesystems."""
         return [s.code for s in self.search([])]
 
     @api.model
-    @tools.ormcache("code")
+    @api.ormcache("code")
     def _get_fs_by_code_from_cache(self, code):
         return self.get_fs_by_code(code, force_no_cache=True)
 
@@ -395,7 +395,7 @@ class FSStorage(models.Model):
         return fs
 
     @api.model
-    @tools.ormcache("model_name", "field_name")
+    @api.ormcache("model_name", "field_name")
     def get_storage_code_by_model_field(self, model_name, field_name=None):
         """Return the storage backend associated to the given model and field.
 
