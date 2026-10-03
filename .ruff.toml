@@ -3,6 +3,13 @@ target-version = "py310"
 fix = true
 
 [lint]
+# Pin the base rule set instead of inheriting ruff's defaults. The 20.0
+# skeleton moved the ruff hook from 0.13 to 0.16.8, whose defaults enable 429
+# rules rather than E4/E7/E9/F -- so code that was clean on 19.0 lands red on
+# BLE001/SIM1xx/TRY2xx without anyone having changed it. Pinning keeps the
+# selection the repo's own decision and immune to the next rev bump; widening
+# it is then a deliberate commit, not a side effect.
+select = ["E4", "E7", "E9", "F"]
 extend-select = [
     "B",
     "C90",
