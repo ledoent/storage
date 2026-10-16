@@ -32,6 +32,8 @@ from odoo.addons.base.models.ir_attachment import (
     IrAttachment as BaseIrAttachment,
 )
 
+from odoo.http.stream import Stream
+
 from ..fs_stream import FsStream
 from .strtobool import strtobool
 
@@ -434,6 +436,22 @@ class IrAttachment(models.Model):
         self.ensure_one()
         if self._is_file_from_a_storage(self.store_fname):
             return FsStream.from_fs_attachment(self)
+        if not self.store_fname and self.db_datas and self.url:
+            # odoo/odoo@8cbf10c moved `data = self.raw.content` below
+            # `elif self.url:`, so db content is unreachable once a url is set --
+            # and force_db leaves store_fname empty with the url intact. Narrow
+            # on purpose: a url with no db_datas is a genuine redirect.
+            data = self.raw.content
+            return Stream(
+                type="data",
+                data=data,
+                last_modified=self.write_date,
+                size=len(data),
+                mimetype=self.mimetype,
+                download_name=self.name,
+                etag=self.checksum,
+                public=self.public,
+            )
         return super()._to_http_stream()
 
     ##############################################

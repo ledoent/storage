@@ -96,6 +96,37 @@ class TestStream(HttpCaseWithUserDemo):
             self.assertEqual(res.content, assert_content, "Wong content")
         return res
 
+    def test_content_url_attachment_forced_to_db(self):
+        """Forced to the db, an attachment must serve bytes, not redirect.
+
+        test_force_attachment_in_db_rules covers the same storage decision at
+        rest and stays green with the defect; this one fetches.
+        """
+        self.authenticate("admin", "admin")
+        self.temp_backend.use_as_default_for_attachments = True
+        self.temp_backend.force_db_for_default_attachment_rules = '{"text/plain": 0}'
+        attachment = self.env["ir.attachment"].create(
+            {
+                "name": "forced_to_db.txt",
+                "raw": b"stored in the database",
+                "public": True,
+                "url": "/web/content/forced_to_db.txt",
+            }
+        )
+        self.env.flush_all()
+        # precondition: the rules put it in the DB and left a url on it
+        self.assertFalse(attachment.store_fname)
+        self.assertTrue(attachment.db_datas)
+        self.assertTrue(attachment.url)
+
+        self.assertDownload(
+            f"/web/content/{attachment.id}",
+            headers={},
+            assert_status_code=200,
+            assert_headers={},
+            assert_content=b"stored in the database",
+        )
+
     def test_content_url(self):
         self.authenticate("admin", "admin")
         url = f"/web/content/{self.attachment_binary.id}"
