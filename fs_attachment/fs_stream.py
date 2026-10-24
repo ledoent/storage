@@ -26,6 +26,12 @@ class FsStream(Stream):
 
     type: typing.Literal["data", "path", "url", "fs"]
     fs_attachment: IrAttachment | None = None
+    # Resolved in ``from_fs_attachment`` so that serving the response needs no
+    # database access. See the comment there.
+    fs_filesystem: typing.Any = None
+    fs_path: str | None = None
+    fs_use_x_sendfile: bool = False
+    fs_x_sendfile_path: str | None = None
     _data: bytes | None = None
 
     def __init__(self, **kwargs):
@@ -42,7 +48,25 @@ class FsStream(Stream):
         attachment.ensure_one()
         if not attachment.fs_filename:
             raise ValueError("Attachment is not stored into a filesystem storage")
+        # A stream has to be self-contained once built: the caller may serve it
+        # after the cursor it was built in has closed. ``web``'s
+        # ``content_assets`` does exactly that -- it opens a read-write cursor
+        # to generate a missing asset bundle and calls ``get_response()`` after
+        # that ``with`` block exits -- so the first request for every bundle
+        # after an upgrade used to 500 with "Cursor already closed".
+        #
+        # Caching the fields is not enough, because closing the cursor also
+        # clears the environment cache. They are read as plain values here. The
+        # fsspec filesystem is not bound to the cursor and opens nothing until
+        # it is read, so holding it costs no I/O for a request that 304s.
+        use_x_sendfile = attachment._fs_use_x_sendfile()
         return cls(
+            fs_filesystem=attachment.fs_storage_id.fs,
+            fs_path=attachment.fs_filename,
+            fs_use_x_sendfile=use_x_sendfile,
+            fs_x_sendfile_path=(
+                attachment._get_x_sendfile_path() if use_x_sendfile else None
+            ),
             mimetype=attachment.mimetype,
             download_name=attachment.name,
             conditional=True,
@@ -69,7 +93,7 @@ class FsStream(Stream):
 
     def read(self) -> bytes:
         if self.type == "fs":
-            with self.fs_attachment.open("rb") as f:
+            with self.fs_filesystem.open(self.fs_path, "rb") as f:
                 return f.read()
         return super().read()
 
@@ -103,14 +127,14 @@ class FsStream(Stream):
             "response_class": Response,
             **send_file_kwargs,
         }
-        use_x_sendfile = self.fs_attachment._fs_use_x_sendfile()
+        use_x_sendfile = self.fs_use_x_sendfile
         send_file_kwargs["use_x_sendfile"] = use_x_sendfile
         if not use_x_sendfile:
             # The file will be closed by werkzeug...
-            f = self.fs_attachment.open("rb")
+            f = self.fs_filesystem.open(self.fs_path, "rb")
             res = _send_file(f, **send_file_kwargs)
         else:
-            x_sendfile_path = self.fs_attachment._get_x_sendfile_path()
+            x_sendfile_path = self.fs_x_sendfile_path
             res = _send_file("", **send_file_kwargs)
             # nginx specific headers
             res.headers["X-Accel-Redirect"] = x_sendfile_path

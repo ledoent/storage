@@ -8,6 +8,9 @@ import tempfile
 
 from PIL import Image
 
+from odoo import api
+from odoo.modules.registry import Registry
+
 from odoo.addons.base.tests.common import HttpCaseWithUserDemo
 
 
@@ -192,6 +195,27 @@ class TestStream(HttpCaseWithUserDemo):
             },
         )
         self.assertEqual(Image.open(io.BytesIO(avatar_res.content)).size, (128, 128))
+
+    def test_stream_survives_the_cursor_it_was_built_in(self):
+        """A stream must still serve after its cursor is gone.
+
+        ``web``'s ``content_assets`` opens a second, read-write cursor to
+        generate a missing asset bundle and calls ``stream.get_response()``
+        after that cursor has closed. Touching the recordset at that point
+        raises ``psycopg2.InterfaceError: Cursor already closed`` and the
+        request 500s -- once per bundle, right after every upgrade.
+
+        Built in a real cursor that is then really closed, because caching the
+        fields is not enough: closing the cursor clears the cache too, which a
+        query-counting test does not notice.
+        """
+        registry = Registry(self.env.cr.dbname)
+        with registry.cursor(readonly=False) as cr:
+            env = api.Environment(cr, self.env.uid, {})
+            attachment = env["ir.attachment"].browse(self.attachment_binary.id)
+            stream = attachment._to_http_stream()
+
+        self.assertEqual(stream.read(), self.content)
 
     def test_image_url_name_with_newline(self):
         """Test downloading a file with a newline in the name.
