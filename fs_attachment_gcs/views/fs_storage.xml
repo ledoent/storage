@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- Copyright 2026 Ledo Enterprises
+     License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl). -->
+<odoo>
+    <record id="fs_storage_form_view" model="ir.ui.view">
+        <field name="model">fs.storage</field>
+        <field name="inherit_id" ref="fs_attachment.fs_storage_form_view" />
+        <field name="arch" type="xml">
+            <field name="use_x_sendfile_to_serve_internal_url" position="after">
+                <!-- `protocol not in ('gs','gcs')` and not `!= 'gs'`: gcsfs
+                     advertises both spellings and a storage may be configured
+                     with either. -->
+                <field
+                    name="gcs_uses_signed_url_for_x_sendfile"
+                    invisible="not use_x_sendfile_to_serve_internal_url or protocol not in ('gs', 'gcs')"
+                />
+                <field
+                    name="gcs_signed_url_expiration"
+                    invisible="not use_x_sendfile_to_serve_internal_url or protocol not in ('gs', 'gcs')"
+                />
+            </field>
+        </field>
+    </record>
+</odoo>
