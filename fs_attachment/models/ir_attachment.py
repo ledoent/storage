@@ -9,6 +9,7 @@ import logging
 import mimetypes
 import os
 import re
+import shutil
 import time
 from contextlib import closing, contextmanager
 from pathlib import Path
@@ -21,6 +22,7 @@ import odoo
 from odoo import api, fields, models
 from odoo.exceptions import AccessError, UserError
 from odoo.fields import Domain
+from odoo.tools.binary import BinaryValue
 
 from .strtobool import strtobool
 
@@ -48,6 +50,92 @@ def clean_fs(files):
                 _logger.info(
                     "_file_delete could not unlink %s", full_path, exc_info=True
                 )
+
+
+class FsBinaryFile(BinaryValue):
+    """A binary value backed by a file on an fsspec filesystem.
+
+    20.0 stopped exchanging raw bytes for binary fields and now passes a
+    ``BinaryValue`` proxy, so the content can be fetched lazily
+    (``odoo/tools/binary.py``). Core provides ``LocalBinaryFile`` for the local
+    filestore; this is the same idea over fsspec, and it is the reason a read
+    from S3 no longer has to pull the whole object into memory just to hand it
+    to the ORM.
+    """
+
+    __slots__ = ("_attachment", "_checksum", "_content", "_size", "_store_fname")
+
+    def __init__(self, attachment):
+        self._attachment = attachment
+        # Snapshot the location. A BinaryValue is the value of a field at the
+        # moment it was read, and the record is free to move afterwards --
+        # force_storage_to_db sets store_fname to False, and a lazily-resolved
+        # handle would then try to parse False.
+        self._store_fname = attachment.store_fname
+        self._checksum = attachment.checksum
+        self._content = None
+        self._size = None
+
+    def open(self) -> io.IOBase:
+        fs, _storage_code, path = self._attachment._fs_parse_store_fname(
+            self._store_fname
+        )
+        return fs.open(path, "rb")
+
+    @property
+    def content(self) -> bytes:
+        if self._content is None:
+            self._content = self._read()
+        return self._content
+
+    def _read(self) -> bytes:
+        if not self._store_fname:
+            return b""
+        try:
+            with self.open() as f:
+                return f.read()
+        except OSError:
+            _logger.info("Error reading %s", self._store_fname, exc_info=True)
+            return b""
+
+    @property
+    def size(self) -> int:
+        """The size from the storage's metadata, without fetching the object.
+
+        BinaryValue.size measures len(self.content), which for a remote
+        storage means downloading the file to find out how big it is. Core's
+        LocalBinaryFile answers from os.stat for the same reason; fsspec
+        exposes the equivalent. This is asked for on every write that goes
+        through the force-to-db size rules, so it is not a rare path.
+        """
+        if self._content is not None:
+            return len(self._content)
+        if self._size is None:
+            try:
+                fs, _storage_code, path = self._attachment._fs_parse_store_fname(
+                    self._store_fname
+                )
+                self._size = fs.size(path)
+            except OSError:
+                # Same outcome as an unreadable content: zero, logged there.
+                self._size = len(self.content)
+        return self._size
+
+    @property
+    def checksum(self) -> str:
+        # The attachment's stored checksum, like core's LocalBinaryFile. Note
+        # this is ir.attachment's sha1, not BinaryValue.checksum's sha256 --
+        # core's own override has the same discrepancy, and nothing in the
+        # write path consults it: _get_datas_related_values recomputes through
+        # _compute_checksum, so this cannot stamp a stale value onto a record.
+        return self._checksum
+
+    @property
+    def filename(self) -> str:
+        # The attachment's name, like core's LocalBinaryFile -- NOT the storage
+        # filename. _check_contents defaults a missing name from this value, so
+        # returning fs_filename there renames attachments to their stored file.
+        return self._attachment.name or ""
 
 
 class IrAttachment(models.Model):
@@ -219,9 +307,32 @@ class IrAttachment(models.Model):
             if mimetype.startswith(mimetype_key):
                 if not limit:
                     return True
-                bin_data = data
-                return len(bin_data) <= limit
+                # 20.0 hands a BinaryValue here, not bytes, so len() raises.
+                # .size is the proxy's own accessor and both LocalBinaryFile
+                # and FsBinaryFile answer it from metadata rather than by
+                # reading the file.
+                return data.size <= limit
         return False
+
+    @api.model
+    def _fs_build_store_fname(self, data) -> str:
+        """Build the store_fname for the given content.
+
+        Split out of _get_datas_related_values because 20.0's _file_write no
+        longer chooses the name -- callers that used to get it back from
+        _file_write have to ask for it first.
+
+        It dispatches the way 19.0's _file_write did: only a filesystem storage
+        gets the "<storage>://<path>" form. Otherwise this is Odoo's own
+        filestore (or the database) and the name has to be core's, or the
+        "<location>://" prefix is taken for a directory and the file lands at
+        ".../filestore/<db>/file//<sha>".
+        """
+        storage = self.env.context.get("storage_location") or self._storage()
+        if storage not in self._get_storage_codes():
+            return self._file_fname(self._compute_checksum(data))
+        path = self._get_fs_path(storage, data)
+        return f"{storage}://{path}"
 
     def _get_datas_related_values(self, data, mimetype):
         values = super(
@@ -239,10 +350,9 @@ class IrAttachment(models.Model):
                 )
             else:
                 # Uses the full object storage path; standard Odoo uses a relative path.
-                path = self._get_fs_path(storage, data)
                 values.update(
                     {
-                        "store_fname": f"{storage}://{path}",
+                        "store_fname": self._fs_build_store_fname(data),
                         "db_datas": False,
                     }
                 )
@@ -303,9 +413,7 @@ class IrAttachment(models.Model):
     def write(self, vals):
         if not self:
             return super().write(vals)
-        if ("datas" in vals or "raw" in vals) and not (
-            "name" in vals or "mimetype" in vals
-        ):
+        if "raw" in vals and not ("name" in vals or "mimetype" in vals):
             mimetype = self._compute_mimetype(vals)
             if mimetype and mimetype != "application/octet-stream":
                 vals["mimetype"] = mimetype
@@ -330,6 +438,12 @@ class IrAttachment(models.Model):
                             "mimetypes at the same time."
                         )
                     )
+        # Captured BEFORE super().write: 20.0's _check_contents defaults a
+        # missing "name" from raw.filename and mutates this very dict, so by
+        # the time the write returns, "name" in vals no longer means the caller
+        # asked to rename anything -- and the rename would then run a second
+        # time on top of the one _inverse_raw already did.
+        name_written = "name" in vals
         for rec in self:
             # As when creating a new attachment, we must pass the res_field
             # and res_model into the context hence sadly we must perform 1 call
@@ -342,26 +456,39 @@ class IrAttachment(models.Model):
                 ),
             ).write(vals)
 
-        if "name" in vals:
+        if name_written:
             self._enforce_meaningful_storage_filename()
 
         return True
 
-    @api.model
-    def _file_read(self, fname, size=None):
-        if self._is_file_from_a_storage(fname):
-            return self._storage_file_read(fname, size)
-        else:
-            return super()._file_read(fname, size)
+    def _inverse_raw(self) -> None:  # pylint: disable=missing-return
+        # 20.0 removed _set_attachment_data; writing `raw` now runs through
+        # _inverse_raw, so that is where the meaningful-filename rewrite hooks.
+        # create() keeps its own explicit call: _inverse_raw does not fire on
+        # every create path, and dropping it there cost 13 tests.
+        super()._inverse_raw()
+        self._enforce_meaningful_storage_filename()
+
+    def _file_read(self) -> BinaryValue:
+        # 20.0 dropped the fname/size arguments: the caller reads
+        # ``self.store_fname`` and expects a BinaryValue back, not bytes.
+        if self._is_file_from_a_storage(self.store_fname):
+            return FsBinaryFile(self)
+        return super()._file_read()
 
     @api.model
-    def _file_write(self, bin_data, checksum):
-        location = self.env.context.get("storage_location") or self._storage()
-        if location in self._get_storage_codes():
-            filename = self._storage_file_write(bin_data)
+    def _file_write(  # pylint: disable=missing-return
+        self, fname: str, bin_value: io.IOBase
+    ) -> None:
+        # In 19.0 this method CHOSE the filename and returned it. 20.0 decides
+        # it earlier, in _get_datas_related_values, and passes it in together
+        # with a seekable stream -- which this module already cooperates with,
+        # because its own _get_datas_related_values override is what wrote the
+        # "<storage>://<path>" value now arriving here.
+        if self._is_file_from_a_storage(fname):
+            self._storage_file_write(fname, bin_value)
         else:
-            filename = super()._file_write(bin_data, checksum)
-        return filename
+            super()._file_write(fname, bin_value)
 
     @api.model
     def _file_delete(self, fname) -> None:  # pylint: disable=missing-return
@@ -378,16 +505,16 @@ class IrAttachment(models.Model):
         else:
             super()._file_delete(fname)
 
-    def _set_attachment_data(self, asbytes) -> None:  # pylint: disable=missing-return
-        super()._set_attachment_data(asbytes)
-        self._enforce_meaningful_storage_filename()
-
     ##############################################
     # Internal methods to use the object storage #
     ##############################################
     @api.model
     def _storage_file_read(self, fname: str, size: int | None = None) -> bytes | None:
-        """Read the file from the filesystem storage"""
+        """Read the file from the filesystem storage.
+
+        Kept for callers that want the bytes directly; the ORM itself now goes
+        through FsBinaryFile so that a read can stream.
+        """
         fs, _storage, fname = self._fs_parse_store_fname(fname)
         try:
             with fs.open(fname, "rb") as f:
@@ -402,20 +529,16 @@ class IrAttachment(models.Model):
         return {}
 
     @api.model
-    def _storage_file_write(self, bin_data: bytes) -> str:
-        """Write the file to the filesystem storage"""
-        storage = self.env.context.get("storage_location") or self._storage()
-        fs = self._get_fs_storage_for_code(storage)
-        path = self._get_fs_path(storage, bin_data)
+    def _storage_file_write(self, fname: str, bin_value: io.IOBase) -> None:
+        """Stream the content to the path the fname points at."""
+        fs, _storage, path = self._fs_parse_store_fname(fname)
         dirname = os.path.dirname(path)
-        if not fs.exists(dirname):
-            fs.makedirs(dirname)
-        fname = f"{storage}://{path}"
+        if dirname and not fs.exists(dirname):
+            fs.makedirs(dirname, exist_ok=True)
         kwargs = self._storage_write_option(fs)
         with fs.open(path, "wb", **kwargs) as f:
-            f.write(bin_data)
+            shutil.copyfileobj(bin_value, f)
         self._fs_mark_for_gc(fname)
-        return fname
 
     @api.model
     def _storage_file_delete(self, fname):
@@ -428,7 +551,7 @@ class IrAttachment(models.Model):
         self._fs_mark_for_gc(fname)
 
     @api.model
-    def _get_fs_path(self, storage_code: str, bin_data: bytes) -> str:
+    def _get_fs_path(self, storage_code: str, bin_data: BinaryValue) -> str:
         """Compute the path to store the file in the filesystem storage"""
         key = self.env.context.get("force_storage_key")
         if not key:
@@ -508,7 +631,6 @@ class IrAttachment(models.Model):
             # we need to update the store_fname with the new filename by
             # calling the write method of the field since the write method
             # of ir_attachment prevent normal write on store_fname
-            # flake8: noqa: E231
             attachment._force_write_store_fname(f"{storage}://{new_filename_with_path}")
             self._fs_mark_for_gc(attachment.store_fname)
 
@@ -743,7 +865,7 @@ class IrAttachment(models.Model):
             _logger.info("moving %s on the object storage", fname)
             self.write(
                 {
-                    "datas": self.datas,
+                    "raw": self.raw,
                     # this is required otherwise the
                     # mimetype gets overriden with
                     # 'application/octet-stream'
@@ -755,7 +877,7 @@ class IrAttachment(models.Model):
             return self._full_path(fname)
         elif self.db_datas:
             _logger.info("moving on the object storage from database")
-            self.write({"datas": self.datas})
+            self.write({"raw": self.raw})
 
     @api.model
     def force_storage(self):
@@ -846,7 +968,7 @@ class IrAttachment(models.Model):
                 # write, the mimetype is recomputed if not given. If we don't
                 # pass it nor the name, the mimetype will be set to the default
                 # value 'application/octet-stream' on assets.
-                attachment.write({"datas": attachment.datas})
+                attachment.write({"raw": attachment.raw})
                 if current % 100 == 0 or total - current == 0:
                     _logger.info(
                         "attachment %s/%s after %.2fs",
@@ -902,7 +1024,7 @@ class IrAttachment(models.Model):
                         # each iteration of the loop. The former issue
                         # being that it reads the content of the file of
                         # ALL the attachments on each loop.
-                        new_env.clear()
+                        new_env.transaction.clear()
                         attachment = model_env.browse(attachment_id)
                         path = attachment._move_attachment_to_store()
                         if path:
@@ -1098,11 +1220,14 @@ class AttachmentFileLikeAdapter:
             # _file_write method to create the new empty file with a random
             # content and checksum to avoid collision.
             content = self._gen_random_content()
-            checksum = self.attachment._compute_checksum(content)
-            new_store_fname = self.attachment.with_context(
+            att_ctx = self.attachment.with_context(
                 attachment_res_model=self.attachment.res_model,
                 attachment_res_field=self.attachment.res_field,
-            )._file_write(content, checksum)
+            )
+            # 20.0: _file_write takes the name and a stream, and returns
+            # nothing -- so the name has to be built first.
+            new_store_fname = att_ctx._fs_build_store_fname(content)
+            att_ctx._file_write(new_store_fname, io.BytesIO(content))
             if self.attachment._is_file_from_a_storage(new_store_fname):
                 (
                     filesystem,
@@ -1114,6 +1239,13 @@ class AttachmentFileLikeAdapter:
                 new_filepath = self.attachment._full_path(new_store_fname)
                 old_filepath = self.attachment._full_path(self.attachment.store_fname)
                 filesystem = fsspec.filesystem("file")
+                # 20.0 commits filestore files read-only -- ir_attachment
+                # ._file_write does os.fchmod(..., 0o444) before moving the file
+                # into place -- so the placeholder _file_write just created
+                # cannot be opened for writing. This adapter owns that file; it
+                # generated its random content a moment ago precisely so there
+                # would be something to write over.
+                os.chmod(new_filepath, 0o600)
             if "a" in self.mode:
                 filesystem.cp_file(old_filepath, new_filepath)
             the_file = filesystem.open(
@@ -1173,7 +1305,7 @@ class AttachmentFileLikeAdapter:
     def _ensure_cache_consistency(self):
         """Ensure the cache consistency once the file is closed"""
         if self._is_open_for_modify and not self._is_stored_in_db:
-            self.attachment.invalidate_recordset(fnames=["raw", "datas", "db_datas"])
+            self.attachment.invalidate_recordset(fnames=["raw", "db_datas"])
         if (
             self.attachment.res_model
             and self.attachment.res_id
